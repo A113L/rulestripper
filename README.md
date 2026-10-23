@@ -115,15 +115,3 @@ hashcat -a 0 -m <hash-mode> hashes.txt base_wordlist.txt -r derived.rule
 The output is a standard hashcat rules file: one rule chain per line, with a header
 comment block summarizing the run (timestamp, inputs, depth, worker count, rule counts
 by depth and by mode).
-
-## Self-test
-
-The script includes a built-in self-test that exercises each extraction mode against
-known input/output pairs:
-
-```bash
-python -c "import stripper; stripper._self_test()"
-```
-- Rule chains longer than hashcat's 31-operation limit are not generated.
-- `--no-new-modes` restricts extraction to the original five modes (letter, digit,
-  reverse, delete-edge, duplicate/fold) if you want v1.0-equivalent behavior.
