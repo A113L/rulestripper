@@ -1,4 +1,4 @@
-# Ruletripper — Hashcat Rule Extractor
+# Rulestripper — Hashcat Rule Extractor
 
 Stripper empirically derives [hashcat](https://hashcat.net/hashcat/) rule chains by
 decomposing passwords in a **target** wordlist into transformations of stems found in a
