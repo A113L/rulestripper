@@ -78,12 +78,741 @@ import argparse
 import string
 import itertools
 import multiprocessing as mp
+import atexit
+from multiprocessing.util import Finalize
 from collections import defaultdict
 from functools import partial
 from typing import Dict, Set, Tuple, Optional, List, Iterator, Any
 from tqdm import tqdm
+
+from array import array
+from multiprocessing.shared_memory import SharedMemory
+
+
+def safe_worker_count(n_workers: int) -> int:
+    """Clamp worker count to multiprocessing limits on Windows."""
+    n_workers = max(1, int(n_workers))
+    return min(n_workers, 60) if os.name == 'nt' else n_workers
+
 import time
 import datetime
+
+# ====================================================================
+# SELF-CONTAINED SHARED-MEMORY PRIMITIVES (ported from RULEOPS)
+# ====================================================================
+"""Compact 64-bit hash membership table used by Stage 0 and wordlist loading.
+
+The table stores one 63-bit FNV-1a fingerprint per occupied slot.  It is an
+exact-in-practice membership index (the same collision model used by the
+original compact Stage-0 implementation), but unlike ``set[str]`` it uses
+roughly 9--12 bytes per input word and can be backed by shared memory so
+Windows ``spawn`` workers attach to one physical table instead of receiving
+one pickled copy each.
+"""
+from array import array
+from multiprocessing.shared_memory import SharedMemory
+
+_MASK63 = 0x7FFFFFFFFFFFFFFF
+_FNV_OFFSET = 1469598103934665603
+_FNV_PRIME = 1099511628211
+
+
+def _fnv1a_63(s):
+    h = _FNV_OFFSET
+    for ch in s:
+        h ^= ord(ch)
+        h = (h * _FNV_PRIME) & _MASK63
+    return h
+
+
+class FlatHashSet64:
+    __slots__ = ("table", "mask", "size", "capacity", "_shm", "_owner", "_closed")
+
+    def __init__(self, words=(), load=0.70, *, expected_count=None, shared=False):
+        if expected_count is None:
+            expected_count = len(words)
+        n = max(0, int(expected_count))
+        cap = 16
+        while cap < max(1, int(n / max(0.10, min(float(load), 0.90)))):
+            cap <<= 1
+
+        self.capacity = cap
+        self.mask = cap - 1
+        self.size = 0
+        self._owner = bool(shared)
+        self._closed = False
+        self._shm = SharedMemory(create=True, size=cap * 8) if shared else None
+        if shared:
+            self.table = self._shm.buf.cast("Q")
+            # Newly-created shared memory is zero-filled by the OS.
+        else:
+            self.table = array('Q', bytes(8 * cap))
+        for word in words:
+            self.add(word)
+
+    @classmethod
+    def attach(cls, name, capacity, size):
+        instance = cls.__new__(cls)
+        instance.capacity = int(capacity)
+        instance.mask = instance.capacity - 1
+        instance.size = int(size)
+        instance._owner = False
+        instance._closed = False
+        instance._shm = SharedMemory(name=name, create=False)
+        instance.table = instance._shm.buf.cast("Q")
+        if len(instance.table) != instance.capacity:
+            instance.close()
+            raise ValueError("Shared hash table has an unexpected size")
+        return instance
+
+    @property
+    def shared_name(self):
+        return self._shm.name if self._shm is not None else None
+
+    def descriptor(self):
+        if self._shm is None:
+            raise RuntimeError("Hash table is not backed by shared memory")
+        return (self._shm.name, self.capacity, self.size)
+
+    def add(self, s):
+        h = _fnv1a_63(s)
+        slot = h & self.mask
+        table = self.table
+        want = h + 1  # zero marks an empty slot
+        while True:
+            value = table[slot]
+            if value == 0:
+                table[slot] = want
+                self.size += 1
+                return True
+            if value == want:
+                return False
+            slot = (slot + 1) & self.mask
+
+    def __contains__(self, s):
+        h = _fnv1a_63(s)
+        slot = h & self.mask
+        table = self.table
+        want = h + 1
+        while True:
+            value = table[slot]
+            if value == 0:
+                return False
+            if value == want:
+                return True
+            slot = (slot + 1) & self.mask
+
+    def __len__(self):
+        return self.size
+
+    @property
+    def size_bytes(self):
+        return self.capacity * 8
+
+    def close(self, unlink=False):
+        if self._closed:
+            return
+        self._closed = True
+        table = self.table
+        self.table = None
+        try:
+            table.release()
+        except (AttributeError, BufferError):
+            pass
+        if self._shm is not None:
+            try:
+                self._shm.close()
+            finally:
+                if unlink or self._owner:
+                    try:
+                        self._shm.unlink()
+                    except FileNotFoundError:
+                        pass
+            self._shm = None
+
+    def __del__(self):
+        try:
+            self.close(unlink=False)
+        except Exception:
+            pass
+
+
+class PackedWordRange:
+    """Lazy view over a contiguous or strided range of packed words."""
+
+    __slots__ = ("_buffer", "_indices")
+
+    def __init__(self, buffer, indices):
+        self._buffer = buffer
+        self._indices = indices if isinstance(indices, range) else range(*indices)
+
+    def __len__(self):
+        return len(self._indices)
+
+    def __iter__(self):
+        for index in self._indices:
+            yield self._buffer[index]
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return PackedWordRange(self._buffer, self._indices[index])
+        return self._buffer[self._indices[index]]
+
+
+class PackedWordBuffer:
+    """UTF-8 word storage backed by shared memory.
+
+    Words are concatenated without separators.  A shared uint64 array with
+    ``word_count + 1`` entries stores each word's start/end byte boundaries.
+    Pool tasks therefore need only send integer ranges, never Python strings.
+
+    The process that constructs the buffer owns and unlinks the segments;
+    workers attach by name and only close their local handles.
+    """
+
+    __slots__ = (
+        "word_count", "byte_length", "data_shm", "offsets_shm",
+        "_offsets", "_owner", "_closed", "encoding",
+    )
+
+    def __init__(self, words):
+        offsets = array("Q", [0])
+        if offsets.itemsize != 8:
+            raise RuntimeError("PackedWordBuffer requires 64-bit unsigned offsets")
+
+        packed = bytearray()
+        word_count = len(words)
+        for index, word in enumerate(words):
+            if not isinstance(word, str):
+                raise TypeError(
+                    f"target word at index {index} is {type(word).__name__}, expected str"
+                )
+            packed.extend(word.encode("utf-8"))
+            offsets.append(len(packed))
+
+        self.word_count = word_count
+        self.byte_length = len(packed)
+        self.encoding = "utf-8"
+        self._owner = True
+        self._closed = False
+        self.data_shm = SharedMemory(create=True, size=max(1, self.byte_length))
+        self.offsets_shm = None
+        try:
+            self.offsets_shm = SharedMemory(create=True, size=len(offsets) * offsets.itemsize)
+            if packed:
+                self.data_shm.buf[:self.byte_length] = packed
+            self.offsets_shm.buf[:len(offsets) * offsets.itemsize] = offsets.tobytes()
+            self._offsets = self.offsets_shm.buf.cast("Q")
+        except Exception:
+            if self.offsets_shm is not None:
+                self.offsets_shm.close()
+                self.offsets_shm.unlink()
+            self.data_shm.close()
+            self.data_shm.unlink()
+            raise
+
+    @classmethod
+    def from_iterable(cls, words, *, lowercase=False):
+        """Pack a re-iterable sized collection without making a second list."""
+        if not hasattr(words, "__len__") or not hasattr(words, "__iter__"):
+            raise TypeError("words must be a sized, re-iterable collection")
+
+        def iter_words():
+            for word in words:
+                value = str(word)
+                yield value.lower() if lowercase else value
+
+        word_count = len(words)
+        byte_length = sum(len(word.encode("utf-8")) for word in iter_words())
+        instance = cls.__new__(cls)
+        instance.word_count = word_count
+        instance.byte_length = byte_length
+        instance.encoding = "utf-8"
+        instance._owner = True
+        instance._closed = False
+        instance.data_shm = SharedMemory(create=True, size=max(1, byte_length))
+        instance.offsets_shm = None
+        instance._offsets = None
+        try:
+            instance.offsets_shm = SharedMemory(create=True, size=(word_count + 1) * 8)
+            offsets = instance.offsets_shm.buf.cast("Q")
+            data = instance.data_shm.buf
+            offsets[0] = 0
+            position = 0
+            actual_count = 0
+            for word in iter_words():
+                encoded = word.encode("utf-8")
+                end = position + len(encoded)
+                if encoded:
+                    data[position:end] = encoded
+                position = end
+                actual_count += 1
+                offsets[actual_count] = position
+            if actual_count != word_count or position != byte_length:
+                raise RuntimeError("Word collection changed while packing into shared memory")
+            instance._offsets = offsets
+        except Exception:
+            if instance._offsets is not None:
+                try:
+                    instance._offsets.release()
+                except Exception:
+                    pass
+            if instance.offsets_shm is not None:
+                instance.offsets_shm.close()
+                instance.offsets_shm.unlink()
+            instance.data_shm.close()
+            instance.data_shm.unlink()
+            raise
+        return instance
+
+    @classmethod
+    def from_file(cls, path, *, lowercase=False, encoding="utf-8"):
+        """Load a newline-delimited wordlist directly into shared memory.
+
+        The file is scanned twice so no Python list of millions of strings or
+        intermediate packed bytearray is required.  Empty lines are skipped,
+        matching the existing RULEST wordlist loader.
+        """
+        source = os.fspath(path)
+
+        def iter_words():
+            with open(source, "r", encoding=encoding, errors="replace", newline="") as stream:
+                for line in stream:
+                    word = line.rstrip("\r\n")
+                    if not word:
+                        continue
+                    yield word.lower() if lowercase else word
+
+        word_count = 0
+        byte_length = 0
+        for word in iter_words():
+            encoded = word.encode("utf-8")
+            word_count += 1
+            byte_length += len(encoded)
+
+        instance = cls.__new__(cls)
+        instance.word_count = word_count
+        instance.byte_length = byte_length
+        instance.encoding = "utf-8"
+        instance._owner = True
+        instance._closed = False
+        instance.data_shm = SharedMemory(create=True, size=max(1, byte_length))
+        instance.offsets_shm = None
+        instance._offsets = None
+        try:
+            instance.offsets_shm = SharedMemory(create=True, size=(word_count + 1) * 8)
+            offsets = instance.offsets_shm.buf.cast("Q")
+            data = instance.data_shm.buf
+            position = 0
+            offsets[0] = 0
+            actual_count = 0
+            for word in iter_words():
+                encoded = word.encode("utf-8")
+                end = position + len(encoded)
+                if encoded:
+                    data[position:end] = encoded
+                position = end
+                actual_count += 1
+                offsets[actual_count] = position
+            if actual_count != word_count or position != byte_length:
+                raise RuntimeError("Wordlist changed while it was being packed into shared memory")
+            instance._offsets = offsets
+        except Exception:
+            if instance._offsets is not None:
+                try:
+                    instance._offsets.release()
+                except Exception:
+                    pass
+            if instance.offsets_shm is not None:
+                instance.offsets_shm.close()
+                instance.offsets_shm.unlink()
+            instance.data_shm.close()
+            instance.data_shm.unlink()
+            raise
+        return instance
+
+    def descriptor(self):
+        """Return the compact attachment descriptor used by spawn workers."""
+        return (self.data_name, self.offsets_name, self.word_count, self.byte_length, self.encoding)
+
+    @classmethod
+    def attach(cls, data_name, offsets_name, word_count, byte_length, encoding="utf-8"):
+        """Attach to a buffer created in another process."""
+        instance = cls.__new__(cls)
+        instance.word_count = int(word_count)
+        instance.byte_length = int(byte_length)
+        instance.encoding = str(encoding)
+        instance._owner = False
+        instance._closed = False
+        instance.data_shm = SharedMemory(name=data_name, create=False)
+        try:
+            instance.offsets_shm = SharedMemory(name=offsets_name, create=False)
+        except Exception:
+            instance.data_shm.close()
+            raise
+        instance._offsets = instance.offsets_shm.buf.cast("Q")
+        # SharedWordList may reserve a larger index up front using the source
+        # line count; only the first word_count + 1 offsets are populated.
+        if len(instance._offsets) < instance.word_count + 1:
+            instance.close()
+            raise ValueError("Shared word offset table is shorter than the word count")
+        return instance
+
+    @property
+    def data_name(self):
+        return self.data_shm.name
+
+    @property
+    def offsets_name(self):
+        return self.offsets_shm.name
+
+    def __len__(self):
+        return self.word_count
+
+    def _decode_word(self, index):
+        if index < 0:
+            index += self.word_count
+        if index < 0 or index >= self.word_count:
+            raise IndexError("packed word index out of range")
+        start = self._offsets[index]
+        end = self._offsets[index + 1]
+        return self.data_shm.buf[start:end].tobytes().decode(self.encoding)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return PackedWordRange(self, range(*index.indices(self.word_count)))
+        return self._decode_word(index)
+
+    def range_view(self, start, stop):
+        start = max(0, min(self.word_count, int(start)))
+        stop = max(start, min(self.word_count, int(stop)))
+        return PackedWordRange(self, range(start, stop))
+
+    def close(self):
+        """Release local handles and unlink segments when called by the owner."""
+        if self._closed:
+            return
+        self._closed = True
+        offsets = self._offsets
+        self._offsets = None
+        if offsets is not None:
+            offsets.release()
+        for shared in (self.offsets_shm, self.data_shm):
+            try:
+                shared.close()
+            finally:
+                if self._owner:
+                    try:
+                        shared.unlink()
+                    except FileNotFoundError:
+                        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+
+"""Compact target-keyed inverted postings for Rulestripper.
+
+Only BASE-derived keys that can occur in the current TARGET wordlist are
+stored.  Posting values are BASE word indexes, not Python strings.  All large
+arrays live in SharedMemory so multiprocessing with Windows ``spawn`` passes
+only small descriptors to workers.
+"""
+from array import array
+from multiprocessing.shared_memory import SharedMemory
+
+
+_INDEX_KINDS = ("purge", "substr", "omit", "prefix")
+
+
+def _power_of_two(value):
+    result = 16
+    while result < max(16, int(value)):
+        result <<= 1
+    return result
+
+
+def _word_keys(word):
+    """Yield unique (index-kind, key) pairs matching the former Python indexes."""
+    wlen = len(word)
+
+    purge = {word.replace(char, "") for char in set(word)}
+    for key in purge:
+        if key:
+            yield "purge", key
+
+    substrings = set()
+    for start in range(min(wlen, 10)):
+        for end in range(start + 1, min(wlen + 1, 11)):
+            substrings.add(word[start:end])
+    for key in substrings:
+        yield "substr", key
+
+    omitted = set()
+    for start in range(min(wlen, 10)):
+        for omit_n in range(1, min(10, wlen - start) + 1):
+            if start + omit_n > 10:
+                break
+            result = word[:start] + word[start + omit_n:]
+            if result:
+                omitted.add(result)
+    for key in omitted:
+        yield "omit", key
+
+    prefixes = {word[:end] for end in range(1, min(wlen, 10))}
+    for key in prefixes:
+        yield "prefix", key
+
+
+class SharedTargetLookup:
+    """Open-addressed TARGET string -> first word index lookup."""
+
+    __slots__ = ("target_buffer", "capacity", "mask", "hashes_shm", "ids_shm",
+                 "hashes", "ids", "_owner", "_closed")
+
+    def __init__(self, target_buffer):
+        self.target_buffer = target_buffer
+        self.capacity = _power_of_two(int(len(target_buffer) / 0.65) + 1)
+        self.mask = self.capacity - 1
+        self._owner = True
+        self._closed = False
+        self.hashes_shm = SharedMemory(create=True, size=self.capacity * 8)
+        self.ids_shm = None
+        self.hashes = self.hashes_shm.buf.cast("Q")
+        try:
+            self.ids_shm = SharedMemory(create=True, size=self.capacity * 8)
+            self.ids = self.ids_shm.buf.cast("Q")
+            for index, word in enumerate(target_buffer):
+                value = _fnv1a_63(word) + 1
+                slot = value & self.mask
+                while True:
+                    current = self.hashes[slot]
+                    if current == 0:
+                        self.hashes[slot] = value
+                        self.ids[slot] = index + 1
+                        break
+                    if current == value:
+                        existing = self.ids[slot] - 1
+                        if target_buffer[existing] == word:
+                            break
+                    slot = (slot + 1) & self.mask
+        except Exception:
+            self.close()
+            raise
+
+    @classmethod
+    def attach(cls, descriptor, target_buffer):
+        name_hashes, name_ids, capacity = descriptor
+        obj = cls.__new__(cls)
+        obj.target_buffer = target_buffer
+        obj.capacity = int(capacity)
+        obj.mask = obj.capacity - 1
+        obj._owner = False
+        obj._closed = False
+        obj.hashes_shm = SharedMemory(name=name_hashes, create=False)
+        obj.ids_shm = None
+        try:
+            obj.ids_shm = SharedMemory(name=name_ids, create=False)
+            obj.hashes = obj.hashes_shm.buf.cast("Q")
+            obj.ids = obj.ids_shm.buf.cast("Q")
+        except Exception:
+            obj.close()
+            raise
+        return obj
+
+    def descriptor(self):
+        return (self.hashes_shm.name, self.ids_shm.name, self.capacity)
+
+    def find(self, word):
+        value = _fnv1a_63(word) + 1
+        slot = value & self.mask
+        while True:
+            current = self.hashes[slot]
+            if current == 0:
+                return -1
+            if current == value:
+                index = self.ids[slot] - 1
+                if self.target_buffer[index] == word:
+                    return int(index)
+            slot = (slot + 1) & self.mask
+
+    def close(self):
+        if getattr(self, "_closed", True):
+            return
+        self._closed = True
+        for attr in ("hashes", "ids"):
+            view = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if view is not None:
+                try:
+                    view.release()
+                except Exception:
+                    pass
+        for shm in (getattr(self, "ids_shm", None), getattr(self, "hashes_shm", None)):
+            if shm is None:
+                continue
+            try:
+                shm.close()
+            finally:
+                if self._owner:
+                    try:
+                        shm.unlink()
+                    except FileNotFoundError:
+                        pass
+        self.target_buffer = None
+
+
+class _BaseWordPostingView:
+    __slots__ = ("_base", "_values", "_start", "_stop")
+
+    def __init__(self, base_buffer, values, start, stop):
+        self._base = base_buffer
+        self._values = values
+        self._start = int(start)
+        self._stop = int(stop)
+
+    def __len__(self):
+        return self._stop - self._start
+
+    def __iter__(self):
+        for pos in range(self._start, self._stop):
+            yield self._base[int(self._values[pos])]
+
+
+class SharedTargetPostings:
+    """Four shared-memory postings indexes keyed only by TARGET words."""
+
+    __slots__ = ("base_buffer", "target_lookup", "word_count", "_owner", "_closed",
+                 "_resources", "_offsets", "_values", "_value_format")
+
+    def __init__(self, base_buffer, target_lookup, enabled=True):
+        self.base_buffer = base_buffer
+        self.target_lookup = target_lookup
+        self.word_count = len(target_lookup.target_buffer)
+        self._owner = True
+        self._closed = False
+        self._resources = {}
+        self._offsets = {}
+        self._values = {}
+        self._value_format = "I" if len(base_buffer) <= 0xFFFFFFFF else "Q"
+        item_size = 4 if self._value_format == "I" else 8
+
+        counts = {kind: array("Q", [0]) * self.word_count for kind in _INDEX_KINDS}
+        if enabled:
+            for word in base_buffer:
+                for kind, key in _word_keys(word):
+                    target_id = target_lookup.find(key)
+                    if target_id >= 0:
+                        counts[kind][target_id] += 1
+
+        offsets_by_kind = {}
+        totals = {}
+        for kind in _INDEX_KINDS:
+            offsets = array("Q", [0])
+            total = 0
+            for count in counts[kind]:
+                total += count
+                offsets.append(total)
+            offsets_by_kind[kind] = offsets
+            totals[kind] = total
+
+        try:
+            for kind in _INDEX_KINDS:
+                offsets_shm = SharedMemory(create=True, size=max(8, len(offsets_by_kind[kind]) * 8))
+                offsets_view = offsets_shm.buf.cast("Q")
+                offsets_view[:len(offsets_by_kind[kind])] = offsets_by_kind[kind]
+                values_shm = SharedMemory(create=True, size=max(item_size, totals[kind] * item_size))
+                values_view = values_shm.buf.cast(self._value_format)
+                self._resources[kind] = (offsets_shm, values_shm)
+                self._offsets[kind] = offsets_view
+                self._values[kind] = values_view
+
+            cursors = {kind: array("Q", offsets_by_kind[kind][:-1]) for kind in _INDEX_KINDS}
+            if enabled:
+                for base_id, word in enumerate(base_buffer):
+                    for kind, key in _word_keys(word):
+                        target_id = target_lookup.find(key)
+                        if target_id < 0:
+                            continue
+                        position = cursors[kind][target_id]
+                        self._values[kind][position] = base_id
+                        cursors[kind][target_id] = position + 1
+        except Exception:
+            self.close()
+            raise
+
+    @classmethod
+    def attach(cls, descriptor, base_buffer, target_lookup):
+        obj = cls.__new__(cls)
+        obj.base_buffer = base_buffer
+        obj.target_lookup = target_lookup
+        obj.word_count = int(descriptor[0])
+        obj._owner = False
+        obj._closed = False
+        obj._resources = {}
+        obj._offsets = {}
+        obj._values = {}
+        obj._value_format = descriptor[1]
+        try:
+            for kind, offset_name, value_name in descriptor[2:]:
+                offsets_shm = SharedMemory(name=offset_name, create=False)
+                values_shm = SharedMemory(name=value_name, create=False)
+                obj._resources[kind] = (offsets_shm, values_shm)
+                obj._offsets[kind] = offsets_shm.buf.cast("Q")
+                obj._values[kind] = values_shm.buf.cast(obj._value_format)
+        except Exception:
+            obj.close()
+            raise
+        return obj
+
+    def descriptor(self):
+        return (self.word_count, self._value_format) + tuple(
+            (kind, self._resources[kind][0].name, self._resources[kind][1].name)
+            for kind in _INDEX_KINDS
+        )
+
+    def get(self, kind, key, default=()):
+        if kind not in self._offsets:
+            return default
+        target_id = self.target_lookup.find(key)
+        if target_id < 0:
+            return default
+        offsets = self._offsets[kind]
+        start = int(offsets[target_id])
+        stop = int(offsets[target_id + 1])
+        if stop <= start:
+            return default
+        return _BaseWordPostingView(self.base_buffer, self._values[kind], start, stop)
+
+    def close(self):
+        if getattr(self, "_closed", True):
+            return
+        self._closed = True
+        for views in (self._offsets, self._values):
+            for view in views.values():
+                try:
+                    view.release()
+                except Exception:
+                    pass
+            views.clear()
+        for resources in getattr(self, "_resources", {}).values():
+            for shm in resources:
+                try:
+                    shm.close()
+                finally:
+                    if self._owner:
+                        try:
+                            shm.unlink()
+                        except FileNotFoundError:
+                            pass
+        self._resources.clear()
+        # Do not retain references to BASE/TARGET owners after the views are released.
+        self.base_buffer = None
+        self.target_lookup = None
+
 
 # ====================================================================
 # GLOBAL FLAGS  (set from CLI before workers are spawned)
@@ -104,25 +833,43 @@ def _color_support() -> bool:
     import os
     if os.environ.get('NO_COLOR') or os.environ.get('TERM') == 'dumb':
         return False
-    try:
-        import colorama  # type: ignore
-        colorama.init()
-    except ImportError:
-        pass
-    return hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
+    if not (hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()):
+        return False
+    if os.name == 'nt':
+        try:
+            import colorama  # type: ignore
+            colorama.init()
+        except ImportError:
+            try:
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+                mode = ctypes.c_uint32()
+                if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                    kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            except Exception:
+                return False
+    return True
 
 _USE_COLOR = _color_support()
 
 class C:
-    RED     = '\033[91m' if _USE_COLOR else ''
-    GREEN   = '\033[92m' if _USE_COLOR else ''
-    YELLOW  = '\033[93m' if _USE_COLOR else ''
-    BLUE    = '\033[94m' if _USE_COLOR else ''
-    CYAN    = '\033[96m' if _USE_COLOR else ''
-    MAGENTA = '\033[95m' if _USE_COLOR else ''
-    BOLD    = '\033[1m'  if _USE_COLOR else ''
-    DIM     = '\033[2m'  if _USE_COLOR else ''
-    END     = '\033[0m'  if _USE_COLOR else ''
+    RED     = '[91m' if _USE_COLOR else ''
+    GREEN   = '[92m' if _USE_COLOR else ''
+    YELLOW  = '[93m' if _USE_COLOR else ''
+    BLUE    = '[94m' if _USE_COLOR else ''
+    CYAN    = '[96m' if _USE_COLOR else ''
+    MAGENTA = '[95m' if _USE_COLOR else ''
+    BOLD    = '[1m'  if _USE_COLOR else ''
+    DIM     = '[2m'  if _USE_COLOR else ''
+    END     = '[0m'  if _USE_COLOR else ''
+
+def _disable_color() -> None:
+    """Force-disable color output (called when --no-color is passed)."""
+    global _USE_COLOR
+    _USE_COLOR = False
+    for _attr in ('RED','GREEN','YELLOW','BLUE','CYAN','MAGENTA','BOLD','DIM','END'):
+        setattr(C, _attr, '')
 
 def red(t):    return f"{C.RED}{t}{C.END}"
 def green(t):  return f"{C.GREEN}{t}{C.END}"
@@ -564,8 +1311,11 @@ def _chains_from_middle(
     min_stem_len: int,
     max_leet_amb: int,
     leading_ops: Optional[List[str]] = None,
+    target_word_override: Optional[str] = None,
 ) -> Set[str]:
-    target_word = prefix + middle + suffix
+    # Reverse mode searches BASE using the reversed middle, but validation
+    # must compare the generated chain against the original TARGET word.
+    target_word = target_word_override if target_word_override is not None else (prefix + middle + suffix)
     lead        = leading_ops or []
     lead_depth  = len(lead)
 
@@ -607,7 +1357,7 @@ def _chains_from_middle(
 def _extract_insert_mode(
     word: str, base_set: Set[str], max_depth: int,
     min_stem_len: int, max_leet_amb: int,
-    base_by_len: Dict[int, Set[str]] = {},
+    base_by_len: Dict[int, Set[str]] = None,
 ) -> Set[str]:
     """
     INSERT MODE: Detect iNX rules for intra-word character insertions.
@@ -832,28 +1582,55 @@ def _extract_char_duplicate_mode(
 def _extract_ascii_transform_mode(
     word: str, base_set: Set[str], max_depth: int,
     min_stem_len: int, max_leet_amb: int,
-    base_by_len: Dict[int, Set[str]] = {},
-    ascii_idx:   Dict[str, Any] = {},
+    base_by_len: Dict[int, Set[str]] = None,
+    ascii_idx: Dict[str, Any] = None,
 ) -> Set[str]:
-    """
-    ASCII TRANSFORM MODE: Detect +N, -N, LN, RN rules.
+    """Detect +N, -N, LN and RN transforms without a giant ASCII index.
 
-    All lookups are O(1) via ascii_idx (precomputed in extract_stripper_rules_mp).
-    ascii_idx covers both single-position and full-word uniform-offset transforms.
+    The original implementation built a second large dictionary containing
+    every transformed BASE string.  Here we reverse each supported operation
+    against the TARGET and perform an O(1) lookup in the shared BASE hash set.
+    The old index path remains available for the module's self-test helpers.
     """
     found: Set[str] = set()
     if max_depth < 1:
         return found
 
-    for stem, rule in ascii_idx.get(word, set()):
-        if len(stem) < min_stem_len:
-            continue
-        if len(rule.split()) > max_depth:
-            continue
-        if HashcatRuleValidator.validate_rule_for_gpu(rule):
-            if py_apply_chain(rule, stem) == word:
+    if ascii_idx:
+        for stem, rule in ascii_idx.get(word, set()):
+            if len(stem) < min_stem_len or len(rule.split()) > max_depth:
+                continue
+            if HashcatRuleValidator.validate_rule_for_gpu(rule) and py_apply_chain(rule, stem) == word:
+                found.add(rule)
+        return found
+
+    def check(candidate: str, rule: str) -> None:
+        if len(candidate) >= min_stem_len and len(rule.split()) <= max_depth and candidate in base_set:
+            if HashcatRuleValidator.validate_rule_for_gpu(rule) and py_apply_chain(rule, candidate) == word:
                 found.add(rule)
 
+    wlen = len(word)
+    for pos in range(min(wlen, 10)):
+        code = ord(word[pos])
+        if code > 255:
+            continue
+        prefix, suffix = word[:pos], word[pos + 1:]
+        check(prefix + chr((code - 1) & 0xFF) + suffix, f"+{pos}")
+        check(prefix + chr((code + 1) & 0xFF) + suffix, f"-{pos}")
+        if code % 2 == 0:
+            check(prefix + chr(code >> 1) + suffix, f"L{pos}")
+            check(prefix + chr((code >> 1) | 0x80) + suffix, f"L{pos}")
+        if code <= 0x7F:
+            check(prefix + chr((code << 1) & 0xFF) + suffix, f"R{pos}")
+            check(prefix + chr(((code << 1) | 1) & 0xFF) + suffix, f"R{pos}")
+
+    # Multi-position uniform increment/decrement chains generated by v1.1.
+    positions = min(wlen, 10)
+    if positions and positions <= max_depth:
+        plus_source = ''.join(chr((ord(ch) - 1) & 0xFF) for ch in word[:positions]) + word[positions:]
+        minus_source = ''.join(chr((ord(ch) + 1) & 0xFF) for ch in word[:positions]) + word[positions:]
+        check(plus_source, ' '.join(f'+{pos}' for pos in range(positions)))
+        check(minus_source, ' '.join(f'-{pos}' for pos in range(positions)))
     return found
 
 
@@ -977,11 +1754,12 @@ def _extract_separator_title_mode(
 
         lower_word = word.lower()
 
-        # O(1) lowercase-exact lookup when index available; else linear scan.
+        # BASE is normalized to lowercase before it is packed, so a single
+        # membership lookup replaces the old per-worker lowercase dictionary.
         if base_lower_idx:
             stem_candidates = base_lower_idx.get(lower_word, set())
         else:
-            stem_candidates = {s for s in base_set if s.lower() == lower_word}
+            stem_candidates = (lower_word,) if lower_word in base_set else ()
 
         for stem in stem_candidates:
             slen = len(stem)
@@ -1067,7 +1845,7 @@ def _extract_reverse_mode(
         found |= _chains_from_middle(
             middle[::-1], prefix, suffix, base_set,
             max_depth, min_stem_len, max_leet_amb,
-            leading_ops=['r'],
+            leading_ops=['r'], target_word_override=word,
         )
     return found
 
@@ -1242,319 +2020,276 @@ def generate_toggle_chain_seeds(max_depth: int) -> List[str]:
     return sorted(seeds)
 
 # ====================================================================
-# MULTIPROCESSING — WORKER
+# MULTIPROCESSING — SHARED-MEMORY WORKERS
 # ====================================================================
-_worker_base_set:       Set[str]              = set()
-_worker_base_by_len:    Dict[int, Set[str]]   = {}
-_worker_base_lower_idx: Dict[str, Set[str]]   = {}
-# Precomputed inverted indexes — built once, inherited by workers via CoW fork
-_worker_purge_idx:       Dict[str, Set[str]]  = {}  # purge(stem,c)  -> stems
-_worker_substr_idx:      Dict[str, Set[str]]  = {}  # substr(stem)   -> stems (xNM)
-_worker_omit_idx:        Dict[str, Set[str]]  = {}  # omit_range(s)  -> stems (ONM)
-_worker_prefix_idx:      Dict[str, Set[str]]  = {}  # prefix(stem,l) -> stems (truncate)
-_worker_ascii_idx:       Dict[str, Set[Tuple[str,str]]] = {}  # transformed -> {(stem,rule)}
-
-def _worker_init(
-    base_set=None, base_by_len=None, base_lower_idx=None,
-    purge_idx=None, substr_idx=None, omit_idx=None,
-    prefix_idx=None, ascii_idx=None,
-) -> None:
-    """Pool initialiser.
-    With fork globals are inherited via CoW — args are None.
-    With spawn they must be passed explicitly.
-    """
-    global _worker_base_set, _worker_base_by_len, _worker_base_lower_idx
-    global _worker_purge_idx, _worker_substr_idx, _worker_omit_idx
-    global _worker_prefix_idx, _worker_ascii_idx
-    if base_set       is not None: _worker_base_set       = base_set
-    if base_by_len    is not None: _worker_base_by_len    = base_by_len
-    if base_lower_idx is not None: _worker_base_lower_idx = base_lower_idx
-    if purge_idx      is not None: _worker_purge_idx      = purge_idx
-    if substr_idx     is not None: _worker_substr_idx     = substr_idx
-    if omit_idx       is not None: _worker_omit_idx       = omit_idx
-    if prefix_idx     is not None: _worker_prefix_idx     = prefix_idx
-    if ascii_idx      is not None: _worker_ascii_idx      = ascii_idx
+_WORKER_BASE = None
+_WORKER_TARGET = None
+_WORKER_MEMBERSHIP = None
+_WORKER_LOOKUP = None
+_WORKER_POSTINGS = None
+_WORKER_CONFIG = None
+_WORKER_FINALIZER = None
 
 
-def _process_chunk(args: Tuple) -> Set[str]:
-    """
-    Worker function — process a chunk of target words.
-    Returns the set of discovered rule chains.
-    """
-    (words_chunk, max_depth, min_stem_len, max_leet_amb, enable_new_modes, ascii_range) = args
+class _IndexView:
+    """Dict-like adapter so existing extraction modes can use shared postings."""
+    __slots__ = ("_postings", "_kind")
 
-    base_set       = _worker_base_set
-    base_by_len    = _worker_base_by_len
-    base_lower_idx = _worker_base_lower_idx
-    purge_idx      = _worker_purge_idx
-    substr_idx     = _worker_substr_idx
-    omit_idx       = _worker_omit_idx
-    prefix_idx     = _worker_prefix_idx
-    ascii_idx      = _worker_ascii_idx
-    found:  Set[str] = set()
+    def __init__(self, postings, kind):
+        self._postings = postings
+        self._kind = kind
 
-    for word in words_chunk:
-        if not word or len(word) > MAX_WORD_LEN:
-            continue
+    def get(self, key, default=()):
+        return self._postings.get(self._kind, key, default)
 
-        n_digits  = sum(1 for c in word if c.isdigit())
-        n_alpha   = sum(1 for c in word if c.isalpha())
 
-        digit_primary = n_digits > n_alpha
+def _worker_close_shared():
+    global _WORKER_BASE, _WORKER_TARGET, _WORKER_MEMBERSHIP
+    global _WORKER_LOOKUP, _WORKER_POSTINGS, _WORKER_CONFIG, _WORKER_FINALIZER
+    # Explicitly release every exported memoryview before closing its mapping.
+    # Merely dropping these objects is insufficient: at interpreter shutdown
+    # SharedMemory.__del__ can run before a retained memoryview is collected.
+    postings = _WORKER_POSTINGS
+    _WORKER_POSTINGS = None
+    if postings is not None:
+        try:
+            postings.close()
+        except Exception:
+            pass
+    lookup = _WORKER_LOOKUP
+    _WORKER_LOOKUP = None
+    if lookup is not None:
+        try:
+            lookup.close()
+        except Exception:
+            pass
+    for name in ("_WORKER_MEMBERSHIP", "_WORKER_TARGET", "_WORKER_BASE"):
+        item = globals().get(name)
+        globals()[name] = None
+        if item is not None:
+            try:
+                item.close()
+            except Exception:
+                pass
+    _WORKER_CONFIG = None
+    _WORKER_FINALIZER = None
 
-        if digit_primary:
-            found |= _extract_digit_mode(
-                word, base_set, max_depth, min_stem_len,
-            )
-            if n_alpha >= min_stem_len:
-                found |= _extract_letter_mode(
-                    word, base_set, max_depth, min_stem_len, max_leet_amb,
-                )
-        else:
-            found |= _extract_letter_mode(
-                word, base_set, max_depth, min_stem_len, max_leet_amb,
-            )
-            if n_digits > 0:
-                found |= _extract_digit_mode(
-                    word, base_set, max_depth, min_stem_len,
-                )
 
+def _worker_init_shared(base_desc, target_desc, membership_desc, lookup_desc,
+                        postings_desc, max_depth, min_stem_len,
+                        max_leet_ambiguity, enable_new_modes):
+    """Attach to owner-created shared buffers; initializer arguments are names/ints only."""
+    global _WORKER_BASE, _WORKER_TARGET, _WORKER_MEMBERSHIP
+    global _WORKER_LOOKUP, _WORKER_POSTINGS, _WORKER_CONFIG, _WORKER_FINALIZER
+    _WORKER_BASE = PackedWordBuffer.attach(*base_desc)
+    try:
+        _WORKER_TARGET = PackedWordBuffer.attach(*target_desc)
+        _WORKER_MEMBERSHIP = FlatHashSet64.attach(*membership_desc)
+        if lookup_desc is not None:
+            _WORKER_LOOKUP = SharedTargetLookup.attach(lookup_desc, _WORKER_TARGET)
+        if postings_desc is not None:
+            if _WORKER_LOOKUP is None:
+                raise RuntimeError("Rulestripper postings require a shared TARGET lookup")
+            _WORKER_POSTINGS = SharedTargetPostings.attach(postings_desc, _WORKER_BASE, _WORKER_LOOKUP)
+    except Exception:
+        _worker_close_shared()
+        raise
+    _WORKER_CONFIG = (max_depth, min_stem_len, max_leet_ambiguity, enable_new_modes)
+    # multiprocessing workers exit via os._exit(), which does not reliably run
+    # ordinary atexit callbacks. Finalize is part of multiprocessing's own
+    # shutdown path and closes all exported views before the process exits.
+    _WORKER_FINALIZER = Finalize(None, _worker_close_shared, exitpriority=20)
+    atexit.register(_worker_close_shared)
+
+
+def _process_one_target_word(word):
+    max_depth, min_stem_len, max_leet_ambiguity, enable_new_modes = _WORKER_CONFIG
+    base_set = _WORKER_MEMBERSHIP
+    postings = _WORKER_POSTINGS
+    found: Set[str] = set()
+    if not word or len(word) > MAX_WORD_LEN:
+        return found
+
+    n_digits = sum(1 for char in word if char.isdigit())
+    n_alpha = sum(1 for char in word if char.isalpha())
+    digit_primary = n_digits > n_alpha
+    if digit_primary:
+        found |= _extract_digit_mode(word, base_set, max_depth, min_stem_len)
+        if n_alpha >= min_stem_len:
+            found |= _extract_letter_mode(word, base_set, max_depth, min_stem_len, max_leet_ambiguity)
+    else:
+        found |= _extract_letter_mode(word, base_set, max_depth, min_stem_len, max_leet_ambiguity)
+        if n_digits > 0:
+            found |= _extract_digit_mode(word, base_set, max_depth, min_stem_len)
+
+    if max_depth >= 2:
+        found |= _extract_reverse_mode(word, base_set, max_depth, min_stem_len, max_leet_ambiguity)
+        found |= _extract_delete_edge_mode(word, base_set, max_depth, min_stem_len, max_leet_ambiguity)
+    if len(word) >= 2 * min_stem_len:
+        found |= _extract_duplicate_mode(word, base_set, max_depth, min_stem_len)
+
+    if enable_new_modes:
         if max_depth >= 2:
-            found |= _extract_reverse_mode(
-                word, base_set, max_depth, min_stem_len, max_leet_amb,
+            found |= _extract_insert_mode(word, base_set, max_depth, min_stem_len, max_leet_ambiguity)
+        if max_depth >= 1:
+            found |= _extract_swap_mode(word, base_set, max_depth, min_stem_len, max_leet_ambiguity)
+            found |= _extract_range_mode(
+                word, base_set, max_depth, min_stem_len, max_leet_ambiguity,
+                _IndexView(postings, "substr"), _IndexView(postings, "omit"),
             )
-            found |= _extract_delete_edge_mode(
-                word, base_set, max_depth, min_stem_len, max_leet_amb,
+            found |= _extract_char_duplicate_mode(word, base_set, max_depth, min_stem_len)
+            found |= _extract_ascii_transform_mode(word, base_set, max_depth, min_stem_len, max_leet_ambiguity)
+            found |= _extract_truncate_mode(
+                word, base_set, max_depth, min_stem_len, max_leet_ambiguity,
+                _IndexView(postings, "prefix"),
             )
-
-        if len(word) >= 2 * min_stem_len:
-            found |= _extract_duplicate_mode(
-                word, base_set, max_depth, min_stem_len,
+            found |= _extract_purge_mode(
+                word, base_set, max_depth, min_stem_len, max_leet_ambiguity,
+                _IndexView(postings, "purge"),
             )
-
-        # NEW MODES (v1.1)
-        if enable_new_modes:
-            if max_depth >= 2:
-                found |= _extract_insert_mode(
-                    word, base_set, max_depth, min_stem_len, max_leet_amb,
-                    base_by_len,
-                )
-
-            if max_depth >= 1:
-                found |= _extract_swap_mode(
-                    word, base_set, max_depth, min_stem_len, max_leet_amb,
-                )
-
-            if max_depth >= 1:
-                found |= _extract_range_mode(
-                    word, base_set, max_depth, min_stem_len, max_leet_amb,
-                    substr_idx, omit_idx,
-                )
-
-            if max_depth >= 1:
-                found |= _extract_char_duplicate_mode(
-                    word, base_set, max_depth, min_stem_len,
-                )
-
-            if max_depth >= 1:
-                found |= _extract_ascii_transform_mode(
-                    word, base_set, max_depth, min_stem_len, max_leet_amb,
-                    base_by_len, ascii_idx,
-                )
-
-            if max_depth >= 1:
-                found |= _extract_truncate_mode(
-                    word, base_set, max_depth, min_stem_len, max_leet_amb,
-                    prefix_idx,
-                )
-
-            if max_depth >= 1:
-                found |= _extract_purge_mode(
-                    word, base_set, max_depth, min_stem_len, max_leet_amb,
-                    purge_idx,
-                )
-
-            if max_depth >= 1 and len(word) >= 2 * min_stem_len:
-                found |= _extract_repeat_mode(
-                    word, base_set, max_depth, min_stem_len,
-                )
-
-            if max_depth >= 1:
-                found |= _extract_separator_title_mode(
-                    word, base_set, max_depth, min_stem_len, max_leet_amb,
-                    base_lower_idx,
-                )
-
+            if len(word) >= 2 * min_stem_len:
+                found |= _extract_repeat_mode(word, base_set, max_depth, min_stem_len)
+            found |= _extract_separator_title_mode(
+                word, base_set, max_depth, min_stem_len, max_leet_ambiguity,
+            )
     return found
 
-# ====================================================================
-# MULTIPROCESSING DRIVER
-# ====================================================================
+
+def _iter_word_ranges(n_words, chunk_size):
+    """Yield lightweight (start, stop) tasks lazily; never enqueue strings."""
+    for start in range(0, n_words, chunk_size):
+        yield start, min(start + chunk_size, n_words)
+
+
+def _process_target_range(task):
+    start, stop = task
+    if _WORKER_TARGET is None or _WORKER_CONFIG is None:
+        raise RuntimeError("Rulestripper worker shared memory was not initialized")
+    found: Set[str] = set()
+    for word in _WORKER_TARGET.range_view(start, stop):
+        found.update(_process_one_target_word(word))
+    return start, stop, found
+
+
 def extract_stripper_rules_mp(
-    target_words:       List[str],
-    base_set:           Set[str],
-    max_depth:          int  = 0,
-    min_stem_len:       int  = 4,
-    max_leet_ambiguity: int  = 3,
-    workers:            int  = 0,
-    chunk_size:         int  = 0,
-    enable_new_modes:   bool = True,
-    ascii_range:        int  = 3,
+    target_words,
+    base_set,
+    max_depth: int = 0,
+    min_stem_len: int = 4,
+    max_leet_ambiguity: int = 3,
+    workers: int = 0,
+    chunk_size: int = 0,
+    enable_new_modes: bool = True,
+    ascii_range: int = 3,
+    start_method: Optional[str] = None,
 ) -> List[str]:
+    """Extract rules with shared UTF-8 buffers and spawn-safe range tasks.
+
+    BASE membership is a compact shared FlatHashSet64.  Inverted indexes are
+    represented as TARGET-keyed uint64/uint32 postings in shared memory.  Pool
+    task messages contain only two integer offsets, never a chunk of words.
     """
-     Stripper extraction with multiprocessing.
-    """
+    del ascii_range  # retained in the public CLI for backwards compatibility
     if max_depth <= 0:
         max_depth = MAX_HASHCAT_CHAIN
+    requested_workers = safe_worker_count(workers or mp.cpu_count())
 
-    n_workers  = workers  or mp.cpu_count()
-    n_words    = len(target_words)
-
+    owns_target = not isinstance(target_words, PackedWordBuffer)
+    owns_base = not isinstance(base_set, PackedWordBuffer)
+    target_buffer = target_words if not owns_target else PackedWordBuffer.from_iterable(target_words)
+    if owns_base:
+        base_buffer = PackedWordBuffer.from_iterable(base_set, lowercase=True)
+    else:
+        base_buffer = base_set
+    n_words = len(target_buffer)
+    if n_words == 0:
+        if owns_target:
+            target_buffer.close()
+        if owns_base:
+            base_buffer.close()
+        return []
     if chunk_size <= 0:
-        chunk_size = max(500, n_words // (n_workers * 4) + 1)
-
-    chunks = [
-        target_words[i: i + chunk_size]
-        for i in range(0, n_words, chunk_size)
-    ]
-    n_chunks = len(chunks)
-
-    task_args = [
-        (chunk, max_depth, min_stem_len, max_leet_ambiguity, enable_new_modes, ascii_range)
-        for chunk in chunks
-    ]
+        chunk_size = max(500, n_words // (requested_workers * 4) + 1)
+    chunk_size = max(1, int(chunk_size))
+    n_chunks = (n_words + chunk_size - 1) // chunk_size
+    # Do not spawn idle processes when a short TARGET produces only a few tasks.
+    n_workers = min(requested_workers, max(1, n_chunks))
 
     sep_line = cyan("─" * 56)
     log_info("")
     log_info(sep_line)
-    log_info("  " + bold(green("stripper")) + " — Hashcat Rule Extractor")
-    log_info("  " + bold(cyan("v1.1")) + " — 14 extraction modes")
+    log_info("  " + bold(green("rulestripper")) + " — Hashcat Rule Extractor")
+    log_info("  " + bold(cyan("v1.1 · shared-memory")) + " — 14 extraction modes")
     log_info(sep_line)
-    log_info("  target words  : " + bold(str(n_words)))
-    log_info("  base stems    : " + bold(str(len(base_set))))
+    log_info("  target words  : " + bold(f"{n_words:,}"))
+    log_info("  base words    : " + bold(f"{len(base_buffer):,}"))
     log_info("  workers       : " + bold(str(n_workers)))
-    log_info("  chunk size    : " + bold(str(chunk_size)) + "  (" + str(n_chunks) + " tasks)")
+    log_info("  chunk size    : " + bold(f"{chunk_size:,}") + f"  ({n_chunks:,} lazy tasks)")
     log_info("  max depth     : " + bold(str(max_depth)))
     log_info("  min stem      : " + bold(str(min_stem_len)))
     log_info("  leet-amb      : " + bold(str(max_leet_ambiguity)))
     log_info("  new modes     : " + bold(green("enabled") if enable_new_modes else yellow("disabled")))
-    log_info("  ascii range   : " + bold(str(ascii_range)))
+    log_info("  memory        : " + cyan("BASE/TARGET shared UTF-8 + uint64 offsets; range-only Pool tasks"))
     print()
-
-    found: Set[str] = set()
-    t0 = time.time()
-
-    # Build lookup indexes ONCE — workers inherit via fork (CoW, zero copy)
-    log_info("  Building lookup indexes …")
     sys.stdout.flush()
-    base_by_len: Dict[int, Set[str]] = defaultdict(set)
-    base_lower_idx: Dict[str, Set[str]] = defaultdict(set)
-    # Inverted indexes for O(1) lookups in slow extraction modes
-    purge_idx:  Dict[str, Set[str]] = defaultdict(set)
-    substr_idx: Dict[str, Set[str]] = defaultdict(set)
-    omit_idx:   Dict[str, Set[str]] = defaultdict(set)
-    prefix_idx: Dict[str, Set[str]] = defaultdict(set)
-    ascii_idx:  Dict[str, set]      = defaultdict(set)
 
-    for w in base_set:
-        wlen = len(w)
-        base_by_len[wlen].add(w)
-        base_lower_idx[w.lower()].add(w)
+    membership = None
+    target_lookup = None
+    postings = None
+    found: Set[str] = set()
+    started = time.time()
+    try:
+        if enable_new_modes:
+            log_info("  Building shared BASE membership and TARGET-keyed postings …")
+        else:
+            log_info("  Building shared BASE membership (enhanced-mode indexes skipped) …")
+        sys.stdout.flush()
+        membership = FlatHashSet64(base_buffer, shared=True, expected_count=len(base_buffer))
+        if enable_new_modes:
+            target_lookup = SharedTargetLookup(target_buffer)
+            postings = SharedTargetPostings(base_buffer, target_lookup, enabled=True)
 
-        # purge_idx: stem.replace(c,'') -> stem
-        for c in set(w):
-            purge_idx[w.replace(c, '')].add(w)
+        context_name = start_method or ("spawn" if os.name == "nt" else "fork")
+        ctx = mp.get_context(context_name)
+        initializer_args = (
+            base_buffer.descriptor(), target_buffer.descriptor(), membership.descriptor(),
+            target_lookup.descriptor() if target_lookup is not None else None,
+            postings.descriptor() if postings is not None else None,
+            max_depth, min_stem_len, max_leet_ambiguity, enable_new_modes,
+        )
 
-        # substr_idx: all substrings at valid xNM positions -> stem
-        for start in range(min(wlen, 10)):
-            for end in range(start + 1, min(wlen + 1, 11)):
-                substr_idx[w[start:end]].add(w)
+        pool = ctx.Pool(processes=n_workers, initializer=_worker_init_shared, initargs=initializer_args)
+        try:
+            with tqdm(
+                total=n_words, desc=green("  Extracting"), unit="word", ncols=100,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
+            ) as pbar:
+                for start, stop, chunk_rules in pool.imap_unordered(
+                    _process_target_range, _iter_word_ranges(n_words, chunk_size), chunksize=1
+                ):
+                    found.update(chunk_rules)
+                    pbar.set_postfix({"rules": cyan(f"{len(found):,}")}, refresh=False)
+                    pbar.update(stop - start)
+            pool.close()
+            pool.join()
+        except BaseException:
+            pool.terminate()
+            pool.join()
+            raise
+    finally:
+        # Close only after all workers have exited and dropped their views.
+        if postings is not None:
+            postings.close()
+        if target_lookup is not None:
+            target_lookup.close()
+        if membership is not None:
+            membership.close(unlink=True)
+        if owns_target:
+            target_buffer.close()
+        if owns_base:
+            base_buffer.close()
 
-        # omit_idx: stem with contiguous range removed -> stem
-        for start in range(min(wlen, 10)):
-            for omit_n in range(1, min(10, wlen - start) + 1):
-                if start + omit_n > 10:
-                    break
-                result = w[:start] + w[start + omit_n:]
-                if result:
-                    omit_idx[result].add(w)
-
-        # prefix_idx: stem[:l] -> stem  (for truncate 'N, l = N+1 = 1..9)
-        for end in range(1, min(wlen, 10)):
-            prefix_idx[w[:end]].add(w)
-
-        # ascii_idx: single-position transforms -> (stem, rule)
-        for pos in range(min(wlen, 10)):
-            sc = ord(w[pos])
-            for delta, rchar in ((1, '+'), (-1, '-')):
-                t = w[:pos] + chr((sc + delta) & 0xFF) + w[pos + 1:]
-                ascii_idx[t].add((w, f"{rchar}{pos}"))
-            for shifted, rchar in (
-                (chr((sc << 1) & 0xFF), 'L'),
-                (chr((sc >> 1) & 0xFF), 'R'),
-            ):
-                t = w[:pos] + shifted + w[pos + 1:]
-                ascii_idx[t].add((w, f"{rchar}{pos}"))
-        # ascii_idx: multi-position uniform-offset (full +1 / -1 shift)
-        # Covers "+0 +1 +2 ... +N" type rules without O(N) per-word scan.
-        for delta, rchar in ((1, '+'), (-1, '-')):
-            full_t = ''.join(chr((ord(c) + delta) & 0xFF) for c in w)
-            if full_t != w:
-                chain = ' '.join(f"{rchar}{p}" for p in range(min(wlen, 10)))
-                ascii_idx[full_t].add((w, chain))
-
-    base_by_len    = dict(base_by_len)
-    base_lower_idx = dict(base_lower_idx)
-    purge_idx      = dict(purge_idx)
-    substr_idx     = dict(substr_idx)
-    omit_idx       = dict(omit_idx)
-    prefix_idx     = dict(prefix_idx)
-    ascii_idx      = dict(ascii_idx)
-
-    use_fork = hasattr(os, 'fork')
-    ctx = mp.get_context('fork' if use_fork else 'spawn')
-
-    # Set globals BEFORE Pool() — forked workers inherit via CoW,
-    # no pickling of large dicts through pipes.
-    global _worker_base_set, _worker_base_by_len, _worker_base_lower_idx
-    global _worker_purge_idx, _worker_substr_idx, _worker_omit_idx
-    global _worker_prefix_idx, _worker_ascii_idx
-    _worker_base_set       = base_set
-    _worker_base_by_len    = base_by_len
-    _worker_base_lower_idx = base_lower_idx
-    _worker_purge_idx      = purge_idx
-    _worker_substr_idx     = substr_idx
-    _worker_omit_idx       = omit_idx
-    _worker_prefix_idx     = prefix_idx
-    _worker_ascii_idx      = ascii_idx
-
-    if use_fork:
-        pool_kwargs: dict = dict(processes=n_workers,
-                                 initializer=_worker_init)
-    else:
-        pool_kwargs = dict(processes=n_workers,
-                           initializer=_worker_init,
-                           initargs=(base_set, base_by_len, base_lower_idx,
-                                     purge_idx, substr_idx, omit_idx,
-                                     prefix_idx, ascii_idx))
-
-    with ctx.Pool(**pool_kwargs) as pool:
-        with tqdm(
-            total=n_words,
-            desc=green("  Extracting"),
-            unit="word",
-            ncols=88,
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
-        ) as pbar:
-            for (task_arg, chunk_result) in zip(
-                task_args,
-                pool.imap_unordered(_process_chunk, task_args),
-            ):
-                found |= chunk_result
-                pbar.set_postfix({"rules": cyan(str(len(found)))}, refresh=False)
-                pbar.update(len(task_arg[0]))
-
-    elapsed = time.time() - t0
+    elapsed = time.time() - started
     log_info("")
     log_info("[P0]  " + green("Done") + "  —  " + f"{elapsed:.1f}s")
     return sorted(found)
@@ -1642,7 +2377,7 @@ def load_wordlist(path: str) -> List[str]:
 # ====================================================================
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog='stripper',
+        prog='rulestripper',
         description='Stripper — Hashcat Rule Extractor (Enhanced v1.1)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1651,7 +2386,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('target_wordlist', help='Target wordlist (passwords to decompose)')
 
     out = p.add_argument_group('output')
-    out.add_argument('-o', '--output', default='stripper_rules.txt',
+    out.add_argument('-o', '--output', default='rulestripper_rules.txt',
                      help='Output rule file  (default: stripper_rules.txt)')
 
     tun = p.add_argument_group('extraction tuning')
@@ -1677,6 +2412,8 @@ def build_parser() -> argparse.ArgumentParser:
     misc = p.add_argument_group('misc')
     misc.add_argument('--debug', action='store_true',
                       help='Verbose debug output')
+    misc.add_argument('--no-color', action='store_true',
+                      help='Disable colored/ANSI output')
     return p
 
 
@@ -1689,6 +2426,8 @@ def main() -> None:
     VERBOSE = args.debug
     ENABLE_NEW_MODES = not args.no_new_modes
     ASCII_RANGE = args.ascii_range
+    if args.no_color:
+        _disable_color()
 
     sep = cyan("─" * 56)
     BANNER = (
@@ -1704,26 +2443,38 @@ def main() -> None:
           "  —  " + cyan("14 extraction modes") + "  |  multiprocessing")
     print()
 
-    # Load wordlists
-    base_words   = load_wordlist(args.base_wordlist)
-    target_words = load_wordlist(args.target_wordlist)
-    base_set: Set[str] = set(w.lower() for w in base_words)
+    # Stream both lists directly into shared UTF-8 buffers.  No million-item
+    # Python list/set is materialized, and the Pool receives only range tasks.
+    log_info("[LOAD]  BASE " + args.base_wordlist + " …")
+    base_buffer = PackedWordBuffer.from_file(args.base_wordlist, lowercase=True)
+    try:
+        log_info("        " + bold(f"{len(base_buffer):,}") + " words packed in shared RAM")
+        log_info("[LOAD]  TARGET " + args.target_wordlist + " …")
+        target_buffer = PackedWordBuffer.from_file(args.target_wordlist)
+    except Exception:
+        base_buffer.close()
+        raise
+    target_count = len(target_buffer)
+    log_info("        " + bold(f"{target_count:,}") + " words packed in shared RAM")
     print("")
 
     t_start = time.time()
 
-    # Token-strip extraction (multiprocessing)
-    rules = extract_stripper_rules_mp(
-        target_words,
-        base_set,
-        max_depth          = args.max_depth,
-        min_stem_len       = args.min_stem,
-        max_leet_ambiguity = args.leet_amb,
-        workers            = args.workers,
-        chunk_size         = args.chunk_size,
-        enable_new_modes   = ENABLE_NEW_MODES,
-        ascii_range        = args.ascii_range,
-    )
+    try:
+        rules = extract_stripper_rules_mp(
+            target_buffer,
+            base_buffer,
+            max_depth=args.max_depth,
+            min_stem_len=args.min_stem,
+            max_leet_ambiguity=args.leet_amb,
+            workers=args.workers,
+            chunk_size=args.chunk_size,
+            enable_new_modes=ENABLE_NEW_MODES,
+            ascii_range=args.ascii_range,
+        )
+    finally:
+        target_buffer.close()
+        base_buffer.close()
 
     # Toggle-chain seeds
     toggle_seeds: List[str] = []
@@ -1737,7 +2488,7 @@ def main() -> None:
 
     # Stats
     print("")
-    _log_stripper_stats(len(target_words), all_rules)
+    _log_stripper_stats(target_count, all_rules)
 
     # Write output
     depth_dist: Dict[int, int] = defaultdict(int)
@@ -1747,7 +2498,7 @@ def main() -> None:
     depth_summary = '  '.join(f"d{d}:{depth_dist[d]:,}" for d in sorted(depth_dist))
 
     with open(args.output, 'w', encoding='utf-8') as fh:
-        fh.write("# stripper — Hashcat Rule Extractor (Enhanced v1.1)\n")
+        fh.write("# rulestripper — Hashcat Rule Extractor (Enhanced v1.1)\n")
         fh.write("# Generated      : " + datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S') + "\n")
         fh.write("# Base           : " + os.path.basename(args.base_wordlist) + "\n")
         fh.write("# Target         : " + os.path.basename(args.target_wordlist) + "\n")
